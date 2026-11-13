@@ -5,3 +5,13 @@ __pycache__/
 *.gguf
 logs/
 .vscode/
+
+# RAG: производные индексы и скачанные модели — пересоздаются скриптами
+rag_store/
+models/embedding-model/
+models/multilingual-MiniLM/
+models/bge-m3/
+models/embeddrus-v0.2/
+data/minecraft/
+
+

@@ -10,11 +10,12 @@ from pathlib import Path
 
 import mss
 import requests
-import sounddevice as sd
 from PIL import Image
 
 from tts_module import TTSManager
 from stt_module import STTManager
+from rag_module import RAGManager
+
 
 # ================= НАСТРОЙКИ =================
 LLAMA_SERVER = "http://127.0.0.1:8080"
@@ -35,15 +36,50 @@ MAX_TAIL = 30               # хвост совсем без знаков пре
 GEN_TIMEOUT = 180            # максимум на генерацию ответа
 SPOKEN_TIMEOUT = 120         # максимум на ожидание «всё прозвучало»
 
+# ---------- RAG: база знаний по играм ----------
+RAG_ENABLED = True
+# "sentence-transformers" — локальная модель на CPU (мультиязычная, RU+EN).
+# "llama.cpp" — эмбеддинги от отдельного llama-server с GGUF (порт 8081).
+# "hash-ngram" — лексический поиск на numpy без моделей.
+RAG_BACKEND = "sentence-transformers"
+# Локальная папка модели (скачивается download_model.py).
+# bge-m3 — лучшая по качеству, но индексация на CPU занимает ~20 минут.
+# multilingual-MiniLM — быстрее в 15 раз, качество заметно ниже.
+RAG_EMBED_MODEL = str(current_dir / "models" / "bge-m3")
+RAG_EMBED_URL = "http://127.0.0.1:8081"        # только для RAG_BACKEND = "llama.cpp"
+RAG_DATA_DIR = str(current_dir / "data")       # тексты: data/<игра>/*.md|txt
+RAG_STORE_DIR = str(current_dir / "rag_store") # индекс, строится build_index.py
+RAG_TOP_K = 4                  # сколько чанков подмешивать в контекст
+# Порог косинуса. None — подобрать автоматически под бэкенд:
+# 0.35 для sentence-transformers, 0.40 для llama.cpp, 0.08 для hash-ngram.
+# Ставь число вручную, если база начинает тащить мусор или молчать.
+RAG_MIN_SCORE = None
+RAG_MAX_CONTEXT_CHARS = 2400   # потолок по объёму материалов в промпте
+
 SYSTEM_PROMPT = (
     "Ты — голосовой ассистент. Пользователь задаёт вопрос, а тебе дано описание "
     "скриншота его экрана. Отвечай кратко, 1–3 предложения, разговорным языком, "
     "только по сути вопроса. Не пересказывай картинку целиком без запроса."
 )
 
+RAG_PROMPT_RULE = (
+    "Также тебе даны материалы из базы знаний по играм. Опирайся на них: названия "
+    "предметов, блоков, мобов, рецепты и цифры бери оттуда, а не из памяти. "
+    "Если ответа в материалах нет — отвечай по своим знаниям и не выдумывай детали."
+)
+
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("main")
 # =============================================
+
+
+# ---------- Системный промпт с материалами из базы ----------
+def build_system_prompt(context: str) -> str:
+    """Без найденных материалов промпт остаётся исходным — меньше соблазна выдумывать."""
+    if not context:
+        return SYSTEM_PROMPT
+    return f"{SYSTEM_PROMPT}\n\n{RAG_PROMPT_RULE}\n\nМатериалы из базы знаний:\n{context}"
 
 
 # ---------- Скриншот ----------
@@ -105,14 +141,14 @@ def clean_chunk(chunk: str) -> list[str]:
 
 
 # ---------- Потоковый запрос к llama-server ----------
-def stream_answer(question: str, image_data_url: str,
+def stream_answer(question: str, image_data_url: str, context: str,
                   chunk_queue: queue.Queue, stop_event: threading.Event,
                   stream_finished: threading.Event) -> None:
     """Получает ответ потоком (SSE) и складывает готовые фразы в очередь."""
     payload = {
         "model": "gemma3",
         "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": build_system_prompt(context)},
             {
                 "role": "user",
                 "content": [
@@ -245,6 +281,34 @@ def main():
     stt = STTManager(model_path=VOSK_MODEL_PATH, sample_rate=16000)
     stt.start_listening()
 
+    # ---------- RAG: инициализация ----------
+    rag = None
+    rebuild_state = {"running": False}   # защита от параллельных пересборок
+    if RAG_ENABLED:
+        try:
+            rag = RAGManager(
+                data_dir=RAG_DATA_DIR,
+                store_dir=RAG_STORE_DIR,
+                backend=RAG_BACKEND,
+                embed_model=RAG_EMBED_MODEL,
+                embed_url=RAG_EMBED_URL,
+                top_k=RAG_TOP_K,
+                min_score=RAG_MIN_SCORE,
+                max_context_chars=RAG_MAX_CONTEXT_CHARS,
+            )
+            n = rag.load()
+            if n == 0:
+                logger.warning("База знаний пуста — отвечу без RAG. "
+                               "Собери её: python build_index.py")
+            else:
+                # Прогрев в фоне: при недоступной HF-модели загрузка может
+                # идти несколько минут, вешать на это старт нельзя.
+                rag.warmup(background=True)
+                logger.info(f"RAG: {n} чанков, прогрев эмбеддера в фоне")
+        except Exception:
+            logger.exception("RAG не инициализирован, работаю без базы знаний")
+            rag = None
+
     tts.speak("Ассистент готов к работе.")
     logger.info("Готов. Задайте вопрос голосом.")
 
@@ -262,10 +326,65 @@ def main():
                 tts.wait_idle(timeout=5)
                 break
 
+            # ---------- голосовые команды базы знаний ----------
+            if any(w in text for w in ("обнови базу знаний", "пересобери базу",
+                                       "обнови память", "пересобери память")):
+                if rag is None:
+                    tts.speak("База знаний не подключена.")
+                    tts.wait_idle()
+                    continue
+                if rebuild_state["running"]:
+                    tts.speak("Пересборка уже идёт, подожди.")
+                    tts.wait_idle()
+                    continue
+
+                # bge-m3 на CPU считает ~20 минут: держать цикл заблокированным
+                # нельзя, поэтому пересборка идёт в фоне, а ассистент продолжает
+                # отвечать по старому индексу из памяти.
+                tts.speak("Пересобираю базу знаний в фоне. Это займёт около "
+                          "двадцати минут, пока отвечаю по старой базе.")
+                tts.wait_idle()
+
+                def _rebuild_job():
+                    rebuild_state["running"] = True
+                    try:
+                        result = rag.rebuild()
+                        total = sum(result.values())
+                        logger.info(f"Пересборка базы: {result}")
+                        tts.speak(f"База знаний обновлена, {total} чанков.")
+                    except Exception:
+                        logger.exception("Ошибка пересборки базы")
+                        tts.speak("Не удалось пересобрать базу знаний.")
+                    finally:
+                        rebuild_state["running"] = False
+
+                threading.Thread(target=_rebuild_job, daemon=True).start()
+                continue
+
+            if any(w in text for w in ("что в базе знаний", "размер базы",
+                                       "состояние базы", "сколько в базе")):
+                if rag is not None:
+                    total = sum(i.size for i in rag.indexes.values()) if rag.indexes else 0
+                    games = ", ".join(sorted(rag.indexes.keys())) if rag.indexes else "нет игр"
+                    note = " Пересборка идёт." if rebuild_state["running"] else ""
+                    tts.speak(f"В базе {total} чанков, игры: {games}.{note}")
+                else:
+                    tts.speak("База знаний не загружена.")
+                tts.wait_idle()
+                continue
+
             tts.wait_idle()               # дожидаемся синтеза и воспроизведения
 
             logger.info("Делаю скриншот...")
             image = take_screenshot()
+
+            # ---------- RAG: поиск релевантных материалов ----------
+            context = ""
+            if rag is not None:
+                t0 = time.time()
+                context = rag.build_context(text)
+                elapsed = (time.time() - t0) * 1000
+                logger.info(f"RAG: контекст {len(context)} симв. за {elapsed:.0f} мс")
 
             chunk_queue = queue.Queue()
             stop_event = threading.Event()
@@ -277,7 +396,7 @@ def main():
 
             gen_thread = threading.Thread(
                 target=stream_answer,
-                args=(text, image, chunk_queue, stop_event, stream_finished),
+                args=(text, image, context, chunk_queue, stop_event, stream_finished),
                 daemon=True)
             gen_thread.start()
 
