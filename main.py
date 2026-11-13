@@ -23,7 +23,7 @@ LLAMA_SERVER = "http://127.0.0.1:8080"
 current_dir = Path(__file__).parent
 VOSK_MODEL_PATH = str(current_dir / 'models' / 'vosk-model-small-ru-0.22')
 
-MAX_SCREEN_SIDE = 768
+MAX_SCREEN_SIDE = 1280
 JPEG_QUALITY = 70
 MAX_TOKENS = 500
 STREAM_TIMEOUT = (10, 120)   # (подключение, чтение): зависший стрим умрёт через 2 мин, а не 5
