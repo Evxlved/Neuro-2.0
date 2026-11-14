@@ -90,12 +90,12 @@ class Hit:
 
 # ================= ЭМБЕДДЕРЫ =================
 class SentenceTransformerEmbedder:
-    """Локальные эмбеддинги на CPU через sentence-transformers (рекомендуемый вариант)."""
+    """Локальные эмбеддинги на GPU через sentence-transformers (рекомендуемый вариант)."""
 
     backend = "sentence-transformers"
 
     def __init__(self, model_name: str = DEFAULT_EMBED_MODEL,
-                 device: str = "cpu", batch_size: int = 32):
+                 device: str = "gpu", batch_size: int = 32):
         try:
             from sentence_transformers import SentenceTransformer
         except ImportError as e:

@@ -50,8 +50,8 @@ def main():
     parser.add_argument("--embed-model",
                         default=str(Path(__file__).parent / "models" / "bge-m3"),
                         help="Путь к локальной папке модели или имя модели на HF")
-    parser.add_argument("--embed-device", default="cpu",
-                        help="Устройство для sentence-transformers (по умолчанию: cpu)")
+    parser.add_argument("--embed-device", default="gpu",
+                        help="Устройство для sentence-transformers (по умолчанию: gpu)")
     parser.add_argument("--embed-url", default="http://127.0.0.1:8081",
                         help="URL llama-server с embedding-моделью (по умолчанию: "
                              "http://127.0.0.1:8081)")
