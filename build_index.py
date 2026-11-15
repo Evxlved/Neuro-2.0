@@ -11,12 +11,12 @@ build_index.py — сборка / обновление базы знаний RAG
   --data-dir        откуда читать тексты   (по умолчанию data)
   --store-dir       куда писать индекс     (по умолчанию rag_store)
   --backend         бэкенд эмбеддингов:
-                      sentence-transformers  (по умолчанию, локальная модель на CPU)
+                      sentence-transformers  (по умолчанию, локальная модель на GPU/CPU)
                       llama.cpp              (отдельный llama-server)
                       hash                   (лексический поиск без моделей)
   --embed-model     путь к папке модели (по умолчанию models/embeddrus-v0.2)
                     или имя модели на HF
-  --embed-device    cpu / cpu:0 / cpu:1 …
+  --embed-device    auto / cuda / cpu (по умолчанию auto: CUDA, если доступна)
   --embed-url       адрес llama-server с embedding-моделью
   --dry-run         только посчитать, не сохранять
   --quiet           минимум логов
@@ -50,8 +50,9 @@ def main():
     parser.add_argument("--embed-model",
                         default=str(Path(__file__).parent / "models" / "bge-m3"),
                         help="Путь к локальной папке модели или имя модели на HF")
-    parser.add_argument("--embed-device", default="gpu",
-                        help="Устройство для sentence-transformers (по умолчанию: gpu)")
+    parser.add_argument("--embed-device", default="auto",
+                        help="Устройство для sentence-transformers (по умолчанию: auto — "
+                             "CUDA, если доступна, иначе CPU)")
     parser.add_argument("--embed-url", default="http://127.0.0.1:8081",
                         help="URL llama-server с embedding-моделью (по умолчанию: "
                              "http://127.0.0.1:8081)")

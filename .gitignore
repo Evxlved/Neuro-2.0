@@ -13,5 +13,9 @@ models/multilingual-MiniLM/
 models/bge-m3/
 models/embeddrus-v0.2/
 data/minecraft/
-
-
+models/vosk-model-ru-0.42/
+llama.cpp/llama-b12283-bin-win-cuda-13.5-x64/
+models/vosk-model-small-ru-0.22/
+models/
+llama.cpp/
+Neuro LLM/

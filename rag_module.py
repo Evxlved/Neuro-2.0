@@ -88,6 +88,37 @@ class Hit:
     score: float
 
 
+# ================= УСТРОЙСТВО TORCH =================
+def resolve_device(device: str | None = None) -> str:
+    """
+    Приводит устройство к виду, который понимает torch, и включает CUDA-ускорение.
+
+    "auto" / "gpu" / "cuda" -> "cuda", если CUDA реально доступна, иначе "cpu".
+    Явные "cuda:0", "cpu" и т.п. возвращаются как есть.
+    """
+    requested = (device or "auto").strip().lower()
+    if requested in ("auto", "gpu", "cuda"):
+        try:
+            import torch
+        except ImportError:
+            if requested != "auto":
+                logger.warning("torch не установлен — эмбеддер будет на CPU")
+            return "cpu"
+        if not torch.cuda.is_available():
+            if requested != "auto":
+                logger.warning("CUDA недоступна — эмбеддер будет на CPU")
+            return "cpu"
+        # TF32 ускоряет fp32-матмулы на Ampere+ почти без потери качества
+        try:
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+        except Exception:
+            pass
+        logger.info(f"CUDA доступна: {torch.cuda.get_device_name(0)}")
+        return "cuda"
+    return requested
+
+
 # ================= ЭМБЕДДЕРЫ =================
 class SentenceTransformerEmbedder:
     """Локальные эмбеддинги на GPU через sentence-transformers (рекомендуемый вариант)."""
@@ -95,29 +126,53 @@ class SentenceTransformerEmbedder:
     backend = "sentence-transformers"
 
     def __init__(self, model_name: str = DEFAULT_EMBED_MODEL,
-                 device: str = "gpu", batch_size: int = 32):
+                 device: str = "auto", batch_size: int = 32):
         try:
+            import torch
             from sentence_transformers import SentenceTransformer
         except ImportError as e:
             raise RuntimeError(
-                "Нужен пакет sentence-transformers: pip install sentence-transformers"
+                "Нужны пакеты torch и sentence-transformers: "
+                "pip install sentence-transformers"
             ) from e
 
         self.model_name = model_name
         self.batch_size = batch_size
+        self.device = resolve_device(device)
+        # На GPU держим модель в fp16: bge-m3 в fp32 занимает ~2.3 ГБ VRAM,
+        # а на карте рядом живёт llama-server с LLM. На CPU fp16 медленнее.
+        self.dtype = torch.float16 if self.device.startswith("cuda") else torch.float32
 
         # Если это путь к локальной папке — грузим строго с диска, без сети.
         # Иначе sentence-transformers может пойти на HF проверять обновления
         # и висеть, если до CDN не пробиться.
         local_dir = Path(model_name)
         is_local = local_dir.is_dir()
+
+        def _load(dev: str):
+            kwargs = {"device": dev, "model_kwargs": {"torch_dtype": self.dtype}}
+            if is_local:
+                return SentenceTransformer(str(local_dir), local_files_only=True, **kwargs)
+            return SentenceTransformer(model_name, **kwargs)
+
         if is_local:
-            logger.info(f"Загружаю локальный эмбеддер из {local_dir.resolve()}...")
-            self._model = SentenceTransformer(str(local_dir), device=device,
-                                              local_files_only=True)
+            logger.info(f"Загружаю локальный эмбеддер из {local_dir.resolve()} "
+                        f"на {self.device} ({self.dtype})...")
         else:
-            logger.info(f"Загружаю эмбеддер {model_name} ({device})...")
-            self._model = SentenceTransformer(model_name, device=device)
+            logger.info(f"Загружаю эмбеддер {model_name} на {self.device} ({self.dtype})...")
+
+        try:
+            self._model = _load(self.device)
+        except Exception:
+            # Ошибка CUDA (нет драйвера, OOM, неподходящая сборка torch) не должна
+            # оставлять ассистента без базы — честно откатываемся на CPU.
+            if not self.device.startswith("cuda"):
+                raise
+            logger.exception(f"Не удалось загрузить эмбеддер на {self.device}, "
+                             f"переключаюсь на CPU")
+            self.device = "cpu"
+            self.dtype = torch.float32
+            self._model = _load("cpu")
 
         # в новых версиях sentence-transformers метод переименован
         dim_fn = getattr(self._model, "get_embedding_dimension", None) \
@@ -508,7 +563,7 @@ class RAGManager:
                  backend: str = "sentence-transformers",
                  embed_model: str = DEFAULT_EMBED_MODEL,
                  embed_url: str = "http://127.0.0.1:8081",
-                 embed_device: str = "cpu",
+                 embed_device: str = "auto",
                  top_k: int = 4,
                  min_score: float | None = None,
                  max_per_source: int = 2,
@@ -585,8 +640,9 @@ class RAGManager:
 
             def _job():
                 try:
-                    backend = self._get_embedder().backend
-                    logger.info(f"RAG: эмбеддер готов ({backend!r})")
+                    embedder = self._get_embedder()
+                    logger.info(f"RAG: эмбеддер готов ({embedder.backend!r}, "
+                                f"device={getattr(embedder, 'device', '?')})")
                 except Exception:
                     logger.exception("RAG: эмбеддер не поднялся, база недоступна")
                 finally:
@@ -595,7 +651,10 @@ class RAGManager:
             threading.Thread(target=_job, daemon=True).start()
             return None
 
-        return self._get_embedder().backend
+        embedder = self._get_embedder()
+        logger.info(f"RAG: эмбеддер готов ({embedder.backend!r}, "
+                    f"device={getattr(embedder, 'device', '?')})")
+        return embedder.backend
 
     def _effective_min_score(self, explicit: float | None = None) -> float:
         """Порог по умолчанию зависит от бэкенда — у хэша скоры заметно ниже."""
